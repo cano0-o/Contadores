@@ -51,6 +51,9 @@ HTML_TEMPLATE = """
     }
     .ip-badge { font-family: monospace; font-size: .82rem; }
     .search-box { max-width: 480px; }
+    /* Estilos para la lista de contadores */
+    .counter-list li { border-bottom: 1px dashed #dee2e6; }
+    .counter-list li:last-child { border-bottom: none; }
   </style>
 </head>
 <body>
@@ -60,14 +63,14 @@ HTML_TEMPLATE = """
     <a class="navbar-brand d-flex align-items-center gap-2" href="#">
       <i class="bi bi-printer-fill text-primary"></i> Contadores
     </a>
-    <span class="badge text-bg-light border">cano</span>
+    <span class="badge text-bg-light border">Sucursal México</span>
   </div>
 </nav>
 
 <main class="container">
   <section class="hero text-center">
     <div class="hero-icon mb-3"><i class="bi bi-speedometer2"></i></div>
-    <h1 class="fw-bold mb-2">Consulta de contadores - Sucursal México</h1>
+    <h1 class="fw-bold mb-2">Consulta de contadores</h1>
     <p class="text-secondary mb-4">Accede directamente al contador de cada equipo.</p>
     <div class="input-group search-box mx-auto shadow-sm">
       <span class="input-group-text bg-white border-end-0"><i class="bi bi-search text-secondary"></i></span>
@@ -92,15 +95,18 @@ HTML_TEMPLATE = """
             <div class="text-secondary mb-4">
               <span class="badge bg-light text-dark border ip-badge">192.168.1.164</span>
             </div>
-            <!-- Nuevo sistema de botón y contenedor de resultados -->
             <div class="counter-container">
               <button class="btn btn-primary w-100 btn-fetch-counter" data-ip="192.168.1.164">
-                <i class="bi bi-cloud-download me-2"></i> Extraer contador
+                <i class="bi bi-cloud-download me-2"></i> Extraer contadores
               </button>
-              <div class="counter-result mt-3 d-none text-center bg-light rounded p-2 border">
-                <span class="text-secondary small">Total Impresiones</span><br>
-                <span class="fs-4 fw-bold text-dark total-number">...</span>
+              
+              <!-- Contenedor dinámico para la lista de resultados -->
+              <div class="counter-result mt-3 d-none bg-light rounded p-3 border">
+                <ul class="list-unstyled mb-0 counter-list small">
+                  <!-- Aquí se inyectarán los datos desde JavaScript -->
+                </ul>
               </div>
+              
             </div>
           </div>
         </article>
@@ -122,18 +128,20 @@ HTML_TEMPLATE = """
             </div>
             <div class="counter-container">
               <button class="btn btn-primary w-100 btn-fetch-counter" data-ip="192.168.1.70">
-                <i class="bi bi-cloud-download me-2"></i> Extraer contador
+                <i class="bi bi-cloud-download me-2"></i> Extraer contadores
               </button>
-              <div class="counter-result mt-3 d-none text-center bg-light rounded p-2 border">
-                <span class="text-secondary small">Total Impresiones</span><br>
-                <span class="fs-4 fw-bold text-dark total-number">...</span>
+              
+              <!-- Contenedor dinámico para la lista de resultados -->
+              <div class="counter-result mt-3 d-none bg-light rounded p-3 border">
+                <ul class="list-unstyled mb-0 counter-list small">
+                  <!-- Aquí se inyectarán los datos desde JavaScript -->
+                </ul>
               </div>
+              
             </div>
           </div>
         </article>
       </div>
-      
-      <!-- Agrega más equipos copiando y pegando el bloque de arriba y cambiando el data-ip -->
 
     </div>
 
@@ -170,7 +178,7 @@ HTML_TEMPLATE = """
       const ip = btn.getAttribute('data-ip');
       const container = btn.closest('.counter-container');
       const resultDiv = container.querySelector('.counter-result');
-      const totalSpan = container.querySelector('.total-number');
+      const listElement = container.querySelector('.counter-list');
 
       // Cambiar visualmente el botón
       const originalText = btn.innerHTML;
@@ -178,12 +186,30 @@ HTML_TEMPLATE = """
       btn.disabled = true;
 
       try {
-        // Al estar todo en el mismo programa, usamos ruta relativa (/api/contador)
         const response = await fetch(`/api/contador?ip=${ip}`);
         const data = await response.json();
 
         if (data.success) {
-          totalSpan.textContent = parseInt(data.total).toLocaleString('es-MX'); 
+          listElement.innerHTML = ''; // Limpiar datos anteriores
+          
+          // Iterar sobre todos los contadores que nos devolvió Python
+          for (const [etiqueta, valor] of Object.entries(data.datos)) {
+            // Dar formato al número (12345 -> 12,345)
+            const numFormateado = parseInt(valor).toLocaleString('es-MX'); 
+            
+            // Si la etiqueta es "Total", la hacemos resaltar un poco más
+            const esTotal = etiqueta.toLowerCase().includes('total');
+            const textColor = esTotal ? 'text-primary fw-bold' : 'text-secondary';
+            const valueClass = esTotal ? 'fs-5' : '';
+
+            listElement.innerHTML += `
+              <li class="d-flex justify-content-between align-items-center py-2">
+                <span class="${textColor}">${etiqueta}</span>
+                <span class="fw-bold text-dark ${valueClass}">${numFormateado}</span>
+              </li>
+            `;
+          }
+
           btn.classList.add('d-none');
           resultDiv.classList.remove('d-none');
         } else {
@@ -207,7 +233,6 @@ HTML_TEMPLATE = """
 # 2. LAS RUTAS DEL SERVIDOR (EL BACKEND)
 # ==========================================
 
-# Ruta principal: Muestra la página web
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -221,26 +246,50 @@ def get_contador():
     url = f"http://{ip}/web/guest/es/websys/status/getUnificationCounter.cgi"
     
     try:
-        # Aumentamos el tiempo de espera a 10 segundos
         response = requests.get(url, timeout=10)
         
-        # Si la impresora responde, pero rechaza la conexión (ej. pide contraseña)
         if response.status_code != 200:
             return jsonify({'success': False, 'error': f'Conectó, pero dio el error: {response.status_code}'})
 
-        # Limpieza y extracción
         soup = BeautifulSoup(response.text, 'html.parser')
-        texto_limpio = re.sub(r'\s+', '', soup.get_text())
-
-        # Búsqueda del patrón "Total:123456"
-        match = re.search(r'Total:(\d+)', texto_limpio)
         
-        if match:
-            total = match.group(1)
-            return jsonify({'success': True, 'total': total})
+        # Diccionario para guardar todos los campos encontrados
+        contadores_encontrados = {}
+
+        # ESTRATEGIA 1: Buscar en las tablas HTML (Formato estándar de Ricoh)
+        for fila in soup.find_all('tr'):
+            celdas = fila.find_all(['td', 'th'])
+            # Si la fila tiene al menos 2 columnas (Ej: Columna 1 "Copias", Columna 2 "1500")
+            if len(celdas) >= 2:
+                # Limpiamos el texto (quitamos espacios extra y dos puntos)
+                etiqueta = celdas[0].get_text(strip=True).replace(':', '')
+                valor = celdas[1].get_text(strip=True)
+                
+                # Las impresoras a veces envían números con comas "1,500"
+                valor_limpio = valor.replace(',', '')
+                
+                # Si tenemos una etiqueta y el valor es un número, lo guardamos
+                if etiqueta and valor_limpio.isdigit():
+                    contadores_encontrados[etiqueta] = valor_limpio
+
+        # ESTRATEGIA 2: Si la tabla falló, buscamos texto libre (Fallback)
+        if not contadores_encontrados:
+            texto_completo = soup.get_text()
+            # Busca patrones como "Impresiones Color : 1500" o "Total 542"
+            coincidencias = re.findall(r'([a-zA-ZáéíóúÁÉÍÓÚñÑ\s/]+)[:\s]+([\d,]+)', texto_completo)
+            
+            for etiqueta, valor in coincidencias:
+                etiq_limpia = etiqueta.strip()
+                val_limpio = valor.replace(',', '')
+                # Guardar solo si parece una etiqueta válida
+                if len(etiq_limpia) > 2 and val_limpio.isdigit():
+                    contadores_encontrados[etiq_limpia] = val_limpio
+
+        # Retornar los datos si encontramos al menos un contador
+        if contadores_encontrados:
+            return jsonify({'success': True, 'datos': contadores_encontrados})
         else:
-            print("TEXTO RECIBIDO DE LA IMPRESORA:", texto_limpio) # Esto se imprimirá en tu consola negra
-            return jsonify({'success': False, 'error': 'Página leída, pero no se encontró la palabra "Total:"'})
+            return jsonify({'success': False, 'error': 'No se encontraron datos numéricos en la página de la impresora.'})
             
     except requests.exceptions.Timeout:
         return jsonify({'success': False, 'error': 'La impresora tardó demasiado en responder (Timeout).'})
@@ -253,5 +302,4 @@ def get_contador():
 # 3. INICIO DEL PROGRAMA
 # ==========================================
 if __name__ == '__main__':
-    # host='0.0.0.0' permite que otras computadoras en la red entren a la app
     app.run(host='0.0.0.0', port=5000, debug=True)
