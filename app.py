@@ -53,6 +53,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webmonitor")
 
+# Marcador de version visible en la UI (subtitulo), unicamente para poder
+# confirmar a simple vista que la app esta corriendo esta version del
+# archivo y no una copia vieja en cache. Subir este numero cada vez que se
+# entregue una correccion relevante.
+VERSION_APP = "Cano - 1.5.3 PRE-ALPHA"
+
 DATA_FILE = Path(__file__).parent / "impresoras.json"
 REQUEST_TIMEOUT = 10  # segundos
 MAX_CONSULTAS_SIMULTANEAS = 6  # cuantas impresoras se consultan en paralelo
@@ -61,13 +67,7 @@ MAX_CONSULTAS_SIMULTANEAS = 6  # cuantas impresoras se consultan en paralelo
 # Solo se incluyen equipos de linea MP e IM (mono y color), que es el
 # alcance soportado por esta version de la app.
 EQUIPOS_INICIALES = [
-    {"modelo": "Ricoh Aficio MP W3601", "ip": "192.168.1.77", "serie": ""},
-    {"modelo": "Ricoh MP 501", "ip": "192.168.1.164", "serie": ""},
-    {"modelo": "Ricoh MP 5055", "ip": "192.168.1.35", "serie": ""},
-    {"modelo": "Ricoh MP 4055", "ip": "192.168.1.201", "serie": ""},
-    {"modelo": "Ricoh MP 4055", "ip": "192.168.1.34", "serie": ""},
-    {"modelo": "Ricoh IM C4500", "ip": "192.168.1.25", "serie": ""},
-    {"modelo": "Ricoh IM C4500", "ip": "192.168.1.36", "serie": ""},
+    
 ]
 
 IP_REGEX = re.compile(
@@ -103,6 +103,103 @@ def es_modelo_color(modelo: str) -> bool:
 def es_familia_soportada(modelo: str) -> bool:
     """True si el modelo pertenece a una de las familias soportadas (MP/IM)."""
     return familia_de_modelo(modelo) is not None
+
+
+# --------------------------------------------------------------------------
+# Estrategia de "ultimo recurso" para paginas de contador con TABLAS
+# ANIDADAS de varios niveles (Funcion -> Categoria -> A3/DLT/Otros), como
+# se ve en la Ricoh IM C6000 (y probablemente en otros equipos IM/MP
+# recientes). Cuando estas tablas anidadas no calzan con la logica simple
+# de la Estrategia 2 (fila de 2 celdas), el HTML termina leyendose como un
+# solo bloque de texto pegado sin espacios. En vez de tirar ese texto crudo
+# a la pantalla (ilegible e inutil), se reconstruye la jerarquia usando el
+# vocabulario fijo que Ricoh reutiliza en (case-sensitive, tal como aparece
+# en el firmware): Copier/Printer/Fax/Scanner/Coverage/Other Function(s)
+# como "secciones", y Full Color/Black & White/Single Color/Two-color/
+# Total Counter/etc. como "categorias", con A3/DLT, Others, Total, Simplex
+# y Duplex como los valores hoja.
+#
+# NOTA: por like limitacion de este enfoque (no hay estructura real de
+# columnas, solo texto), el desglose Simplex vs Duplex dentro de una misma
+# categoria no siempre se distingue por nombre (apareceran como "... (2)")
+# aunque el valor en si es correcto. Si se necesita precision total en esa
+# distincion, lo ideal es mandar el HTML fuente real de la pagina (Ver
+# codigo fuente / Guardar como) para escribir un parser exacto a la tabla.
+
+PALABRAS_CLAVE_JERARQUIA = [
+    "Full Color Coverage", "B & W Coverage", "Black & White Coverage",
+    "Single Color Coverage", "Two-color Coverage",
+    "Full Color", "Black & White", "Single Color", "Two-color",
+    "Total Counter", "Back Counter", "Refresh Counter",
+    "Fax Transmission", "Send/TX", "Send",
+    "Banner", "Simplex", "Duplex", "Total",
+    "Other Function(s)", "Copier", "Printer", "Fax", "Scanner", "Coverage",
+    "A3/DLT", "Others",
+]
+
+# Palabras que representan una FUNCION del equipo (nivel superior de la
+# jerarquia).
+SECCIONES_JERARQUIA = {"Copier", "Printer", "Fax", "Scanner", "Coverage", "Other Function(s)"}
+
+# Palabras que representan una CATEGORIA (nivel intermedio): quedan
+# "activas" como encabezado para los valores hoja que le sigan (A3/DLT,
+# Others, Total, Simplex, Duplex), hasta que aparezca otra categoria o
+# cambie la seccion.
+CATEGORIAS_QUE_PERSISTEN = {
+    "Full Color Coverage", "B & W Coverage", "Black & White Coverage",
+    "Single Color Coverage", "Two-color Coverage",
+    "Full Color", "Black & White", "Single Color", "Two-color",
+    "Total Counter", "Back Counter", "Refresh Counter",
+    "Fax Transmission", "Send/TX", "Send", "Banner",
+}
+
+# Minimo de anclas reconocidas para confiar en este metodo; si el texto no
+# tiene casi nada de este vocabulario, es mejor fallar limpio que arriesgar
+# resultados sin sentido sobre una pagina que no es de un equipo Ricoh.
+MIN_ANCLAS_JERARQUIA = 4
+
+_REGEX_ANCLAS_JERARQUIA = re.compile(
+    "(" + "|".join(re.escape(p) for p in PALABRAS_CLAVE_JERARQUIA) + ")"
+)
+
+
+def _extraer_contadores_jerarquia(texto_plano: str) -> dict[str, str]:
+    """
+    Reconstruye contadores Seccion/Categoria/Hoja a partir de texto plano
+    sin estructura de tabla reconocible (ver nota arriba). Devuelve un
+    diccionario vacio si no se reconoce suficiente vocabulario Ricoh.
+    """
+    fragmentos = _REGEX_ANCLAS_JERARQUIA.split(texto_plano)
+    if len(fragmentos) < (MIN_ANCLAS_JERARQUIA * 2 + 1):
+        return {}
+
+    contadores: dict[str, str] = {}
+    seccion = ""
+    subcategoria = ""
+
+    for i in range(1, len(fragmentos), 2):
+        palabra_clave = fragmentos[i]
+        texto_entre = fragmentos[i + 1] if i + 1 < len(fragmentos) else ""
+
+        if palabra_clave in SECCIONES_JERARQUIA:
+            seccion = palabra_clave
+            subcategoria = ""
+            continue
+
+        coincidencia_valor = re.match(r":\s*([\d,.]+)\s*%?", texto_entre)
+        valor = limpiar_valor_numerico(coincidencia_valor.group(1)) if coincidencia_valor else None
+
+        if palabra_clave in CATEGORIAS_QUE_PERSISTEN:
+            partes = [seccion, palabra_clave]
+            subcategoria = palabra_clave
+        else:  # valor hoja: A3/DLT, Others, Total, Simplex, Duplex
+            partes = [seccion, subcategoria, palabra_clave]
+
+        if valor:
+            etiqueta = " - ".join(dict.fromkeys(p for p in partes if p))
+            _agregar_contador(contadores, etiqueta, valor)
+
+    return contadores
 
 
 # Palabras clave -> icono, para que el detalle de contadores sea mas intuitivo
@@ -245,13 +342,62 @@ class AlmacenImpresoras:
 # las combinaciones (en particular HTTPS) antes de rendirse.
 
 IDIOMAS_CANDIDATOS = ("es", "en")
-ESQUEMAS_CANDIDATOS = ("https", "http")
+ESQUEMAS_CANDIDATOS = ("https", "http", "")
 
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:  # pragma: no cover - urllib3 siempre viene con requests
     pass
+
+# Sesion dedicada para consultar impresoras, con trust_env=False: esto hace
+# que NO se usen proxies del sistema/variables de entorno (HTTP_PROXY,
+# HTTPS_PROXY) ni configuraciones de .netrc. Es clave en redes de oficina
+# donde hay un proxy corporativo configurado a nivel de sistema operativo:
+# el navegador suele tener excepciones para direcciones locales (LAN) y
+# por eso SI conecta, pero "requests" por defecto SI intenta usar ese
+# proxy para cualquier IP salvo que se le diga explicitamente que no lo
+# haga -- lo cual, para una IP de impresora en la red local, nunca tiene
+# sentido y solo termina en "no hay conexion" o timeouts falsos.
+_sesion_impresoras = requests.Session()
+_sesion_impresoras.trust_env = False
+_sesion_impresoras.proxies = {"http": None, "https": None}
+
+
+try:
+    import ssl
+
+    class _AdaptadorTLSPermisivo(requests.adapters.HTTPAdapter):
+        """
+        Adaptador HTTPS que baja el nivel de seguridad de OpenSSL
+        (SECLEVEL) y habilita renegociacion "insegura" heredada. Es
+        necesario porque equipos Ricoh viejos (p.ej. la linea MP 4055)
+        traen un servidor HTTPS embebido con TLS/cifrados antiguos que
+        OpenSSL 3.x rechaza por defecto, aunque el navegador los acepte
+        sin problema (los navegadores son mas permisivos con estos
+        equipos legados). Sin este ajuste, la conexion truena antes de
+        completar el handshake TLS y se ve como "no hay conexion",
+        aunque el equipo si esta disponible.
+        """
+
+        def init_poolmanager(self, *args, **kwargs):
+            contexto = ssl.create_default_context()
+            contexto.check_hostname = False
+            contexto.verify_mode = ssl.CERT_NONE
+            try:
+                contexto.set_ciphers("DEFAULT:@SECLEVEL=1")
+            except ssl.SSLError:
+                pass
+            try:
+                contexto.options |= 0x4  # ssl.OP_LEGACY_SERVER_CONNECT, si esta disponible
+            except AttributeError:
+                pass
+            kwargs["ssl_context"] = contexto
+            return super().init_poolmanager(*args, **kwargs)
+
+    _sesion_impresoras.mount("https://", _AdaptadorTLSPermisivo())
+except Exception as e:  # pragma: no cover - si algo no es compatible, seguimos con el default
+    logger.warning("No se pudo configurar el adaptador TLS permisivo: %s", e)
 
 
 def _urls_candidatas(ip: str) -> list[str]:
@@ -264,6 +410,7 @@ def _urls_candidatas(ip: str) -> list[str]:
     """
     return [
         f"{esquema}://{ip}/web/guest/{idioma}/websys/status/getUnificationCounter.cgi"
+        # https://192.168.1.220/web/guest/es/websys/status/getUnificationCounter.cgi
         for esquema in ESQUEMAS_CANDIDATOS
         for idioma in IDIOMAS_CANDIDATOS
     ]
@@ -360,37 +507,17 @@ def _extraer_contadores_de_html(html: str) -> dict[str, str]:
     # pegado despues, como "5.678 hojas" o "1,234 pages"); así no hace
     # falta que la celda sea puramente numérica para reconocerla. Este es
     # el formato mas comun en las paginas de contador de equipos MP/IM.
-    empieza_con_digito = re.compile(r"^\d")
-    for fila in soup.find_all("tr"):
-        celdas = fila.find_all(["td", "th"])
-        if len(celdas) < 2:
-            continue
-        textos = [c.get_text(strip=True) for c in celdas]
-        for i in range(len(textos) - 1, 0, -1):
-            candidato = textos[i]
-            if not candidato or not empieza_con_digito.match(candidato):
-                continue
-            valor = limpiar_valor_numerico(candidato)
-            if not valor:
-                continue
-            etiqueta = " ".join(
-                t for t in textos[:i] if t and not empieza_con_digito.match(t)
-            )
-            if etiqueta:
-                _agregar_contador(contadores, etiqueta, valor)
-            break
+    
 
-    # --- Estrategia 3: texto libre (ultimo recurso) ---
+    # --- Estrategia 3: tablas anidadas de varios niveles (ver nota arriba) ---
+    # Reemplaza al viejo "texto libre con regex", que producia bloques de
+    # texto ilegibles (mezclaba etiquetas, valores y hasta texto de ayuda
+    # de la pagina en una sola linea gigante) en equipos con tablas
+    # anidadas como la Ricoh IM C6000. Si no se reconoce suficiente
+    # vocabulario Ricoh, se devuelve vacio (y la UI mostrara un error
+    # limpio) en vez de basura sin sentido.
     if not contadores:
-        texto_completo = soup.get_text()
-        coincidencias = re.findall(
-            r"([a-zA-ZáéíóúÁÉÍÓÚñÑ/\s]+)[:\s]+([\d,.]+)", texto_completo
-        )
-        for etiqueta, valor_texto in coincidencias:
-            etiqueta_limpia = re.sub(r"\s+", " ", etiqueta).strip()
-            valor = limpiar_valor_numerico(valor_texto)
-            if len(etiqueta_limpia) > 2 and valor:
-                _agregar_contador(contadores, etiqueta_limpia, valor)
+        contadores = _extraer_contadores_jerarquia(soup.get_text())
 
     return contadores
 
@@ -425,7 +552,7 @@ def obtener_datos_impresora(ip: str, timeout: int = REQUEST_TIMEOUT) -> dict:
     for url in _urls_candidatas(ip):
         es_https = url.startswith("https")
         try:
-            response = requests.get(url, timeout=timeout, verify=not es_https)
+            response = _sesion_impresoras.get(url, timeout=timeout, verify=not es_https)
         except requests.exceptions.SSLError as e:
             # Certificado autofirmado rechazado u otro problema de TLS:
             # se anota y se sigue probando (p.ej. la variante HTTP, o el
@@ -500,7 +627,8 @@ def main(page: ft.Page) -> None:
     titulo = ft.Text("Consulta de contadores — Sucursal México", size=28,
                       weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
     subtitulo = ft.Text(
-        "Equipos Ricoh línea MP e IM (mono y color). Al abrir, se consultan todos automáticamente.",
+        f"Equipos Ricoh línea MP e IM (mono y color). Al abrir, se consultan todos automáticamente. "
+        f"[{VERSION_APP}]",
         size=16, color=ft.Colors.BLACK54, text_align=ft.TextAlign.CENTER,
     )
 
